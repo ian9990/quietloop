@@ -1,0 +1,45 @@
+name: Watcher
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Every 5 hours. Combined with `concurrency` below and the script's own
+    # MAX_RUNTIME_SECONDS self-exit (set ~5h45m, under GitHub's 6h hard cap
+    # on a single job), a new run is generally already queued and ready to
+    # go the moment the previous one exits -- approximating a continuous
+    # always-on process without ever running two instances at once (which
+    # would double up on alerts, since dedup state is in-memory per
+    # process). Not a guaranteed-precise schedule -- GitHub's cron can lag
+    # under platform load, so treat this as "close to continuous," not a
+    # hard real-time guarantee.
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          API_BASE: ${{ secrets.API_BASE }}
+          COOKIE_NAME: ${{ secrets.COOKIE_NAME }}
+          SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}
+          MIN_LAT: ${{ secrets.MIN_LAT }}
+          MAX_LAT: ${{ secrets.MAX_LAT }}
+          MIN_LON: ${{ secrets.MIN_LON }}
+          MAX_LON: ${{ secrets.MAX_LON }}
+          MAX_RUNTIME_SECONDS: "20700"
+        run: python watcher.py

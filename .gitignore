@@ -1,0 +1,5 @@
+.env
+*.log
+catalog_cache.json
+__pycache__/
+*.pyc

@@ -172,6 +172,30 @@ ICON_BASE = "https://raw.githubusercontent.com/WatWowMap/wwm-uicons/main/pokemon
 
 ALERT_COLOR = 0xE74C3C
 
+# The API's `weather` field is aliased server-side from a
+# weather-boost-condition column -- 0/null means not boosted, any other
+# value is the specific weather condition that boosted it. This numeric
+# enum is a stable convention across this class of map tooling, not
+# something specific to any one deployment.
+WEATHER_NAMES = {
+    1: "Clear",
+    2: "Rainy",
+    3: "Partly Cloudy",
+    4: "Cloudy",
+    5: "Windy",
+    6: "Snow",
+    7: "Fog",
+}
+WEATHER_EMOJI = {
+    1: "☀️",
+    2: "🌧️",
+    3: "⛅",
+    4: "☁️",
+    5: "💨",
+    6: "❄️",
+    7: "🌫️",
+}
+
 # Identifies this script to OpenStreetMap's tile server and Nominatim, per
 # both services' usage policies (they require a descriptive User-Agent, not
 # a generic library default) -- fine for our volume (a handful of requests
@@ -572,26 +596,29 @@ MAP_ATTACHMENT_FILENAME = "location_map.png"
 
 def format_embed(record):
     """Builds a rich embed: an illustrative image as the thumbnail,
-    CP/level/stats, expiry time shown both relative and absolute via
-    Discord's native <t:...> timestamp markup (self-updating client-side,
-    already timezone-correct for every viewer), and a Location field with a
-    reverse-geocoded address plus a Google Maps link. Does NOT set the
-    embed's main 'image' -- that's the locally-composited OSM map, wired up
-    by the caller (send_alert) once it has the attachment bytes, since the
-    embed alone doesn't know whether that attachment succeeded."""
+    CP/level, weather boost status, expiry time shown both relative and
+    absolute via Discord's native <t:...> timestamp markup (self-updating
+    client-side, already timezone-correct for every viewer), and a Location
+    field with a reverse-geocoded address plus a Google Maps link. Does NOT
+    set the embed's main 'image' -- that's the locally-composited OSM map,
+    wired up by the caller (send_alert) once it has the attachment bytes,
+    since the embed alone doesn't know whether that attachment succeeded."""
     name = describe_entry(record.get("pokemon_id"), record.get("form"))
     iv = record.get("iv")
     cp = record.get("cp")
     level = record.get("level")
-    atk, defe, sta = record.get("atk_iv"), record.get("def_iv"), record.get("sta_iv")
+    weather = record.get("weather")
     expire_ts = record.get("expire_timestamp")
     lat, lon = record.get("lat"), record.get("lon")
 
     fields = []
     if cp is not None and level is not None:
         fields.append({"name": "CP / Level", "value": f"{cp} / L{level}", "inline": True})
-    if atk is not None and defe is not None and sta is not None:
-        fields.append({"name": "Stats (Atk/Def/Sta)", "value": f"{atk}/{defe}/{sta}", "inline": True})
+    if weather:
+        emoji = WEATHER_EMOJI.get(weather, "✨")
+        fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
+    else:
+        fields.append({"name": "Weather Boost", "value": "No", "inline": True})
     if expire_ts:
         ts = int(expire_ts)
         fields.append({"name": "Expires", "value": f"<t:{ts}:R> -- <t:{ts}:T>", "inline": False})

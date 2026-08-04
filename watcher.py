@@ -196,6 +196,15 @@ WEATHER_EMOJI = {
     7: "🌫️",
 }
 
+# Standard gender enum used across this class of map tooling: 1=male,
+# 2=female, 3=genderless. No 0/unset case in practice -- every real entry
+# has one of these three.
+GENDER_LABELS = {
+    1: "♂️ Male",
+    2: "♀️ Female",
+    3: "⚪ Genderless",
+}
+
 # Identifies this script to OpenStreetMap's tile server and Nominatim, per
 # both services' usage policies (they require a descriptive User-Agent, not
 # a generic library default) -- fine for our volume (a handful of requests
@@ -608,12 +617,15 @@ def format_embed(record):
     cp = record.get("cp")
     level = record.get("level")
     weather = record.get("weather")
+    gender = record.get("gender")
     expire_ts = record.get("expire_timestamp")
     lat, lon = record.get("lat"), record.get("lon")
 
     fields = []
     if cp is not None and level is not None:
         fields.append({"name": "CP / Level", "value": f"{cp} / L{level}", "inline": True})
+    if gender in GENDER_LABELS:
+        fields.append({"name": "Gender", "value": GENDER_LABELS[gender], "inline": True})
     if weather:
         emoji = WEATHER_EMOJI.get(weather, "✨")
         fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})

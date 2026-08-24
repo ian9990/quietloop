@@ -1,5 +1,6 @@
 .env
 *.log
 catalog_cache.json
+tracked_state.json
 __pycache__/
 *.pyc

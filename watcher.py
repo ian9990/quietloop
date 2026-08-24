@@ -164,6 +164,14 @@ CATALOG_URL = "https://raw.githubusercontent.com/WatWowMap/Masterfile-Generator/
 CATALOG_CACHE_PATH = "catalog_cache.json"
 CATALOG_MAX_AGE = 24 * 60 * 60  # re-fetch at most once a day
 
+# Persists tracked_ids across process restarts -- without this, a fresh
+# process (e.g. a new GitHub Actions job picking up after the previous
+# one's MAX_RUNTIME_SECONDS exit) has no memory of what it already alerted
+# on and re-announces every still-active match from scratch. Loaded once
+# at startup, saved once per poll cycle. On GitHub Actions this file is
+# restored/saved via actions/cache in the workflow, not just local disk.
+TRACKED_STATE_PATH = "tracked_state.json"
+
 # Public icon set the target site's own frontend renders from -- no auth
 # needed. Filenames follow "{id}[_f{form}][_c{costume}].png"; not every
 # form/costume combo has its own asset, so build_icon_url() below checks
@@ -683,6 +691,28 @@ def prune_tracked_ids(now):
     if expired:
         logger.debug(f"Forgot {len(expired)} expired match(es) from tracking.")
 
+def load_tracked_state():
+    """Restores tracked_ids from disk if a state file from a previous run
+    exists -- see TRACKED_STATE_PATH above for why this matters.
+    Missing/corrupt file just means starting fresh (not fatal; worst case
+    is a handful of re-alerts, same as before this existed)."""
+    if not os.path.exists(TRACKED_STATE_PATH):
+        return
+    try:
+        with open(TRACKED_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        tracked_ids.update(state.get("tracked_ids", {}))
+        logger.info(f"Restored tracked state from disk: {len(tracked_ids)} id(s).")
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load {TRACKED_STATE_PATH}: {e} -- starting with empty tracking.")
+
+def save_tracked_state():
+    try:
+        with open(TRACKED_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"tracked_ids": tracked_ids}, f)
+    except OSError as e:
+        logger.warning(f"Failed to save {TRACKED_STATE_PATH}: {e}")
+
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
@@ -706,6 +736,7 @@ def main():
         return
 
     load_catalog()
+    load_tracked_state()
     logger.info("Starting watcher.")
     logger.info(f"Bounding box: ({MIN_LAT},{MIN_LON}) to ({MAX_LAT},{MAX_LON}), polling every {POLL_INTERVAL}s.")
     if MAX_RUNTIME_SECONDS:
@@ -764,6 +795,7 @@ def main():
             logger.debug(f"No new matches this cycle ({len(tracked_ids)} tracked).")
 
         prune_tracked_ids(now)
+        save_tracked_state()
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":

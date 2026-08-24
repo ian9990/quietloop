@@ -31,6 +31,21 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Persists tracked_state.json across job runs -- each ephemeral
+      # runner starts with a fresh checkout, so without this a new job has
+      # no memory of what the previous one already alerted on and
+      # re-announces every still-active match. Key is unique per run (so
+      # the post-job save always writes a fresh entry, since that exact
+      # key never existed before); restore-keys falls back to the most
+      # recent previous entry sharing the prefix.
+      - name: Restore/save tracked state
+        uses: actions/cache@v4
+        with:
+          path: tracked_state.json
+          key: tracked-state-${{ github.run_id }}
+          restore-keys: |
+            tracked-state-
+
       - name: Run watcher
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

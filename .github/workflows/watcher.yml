@@ -49,6 +49,7 @@ jobs:
       - name: Run watcher
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          PVP_DISCORD_WEBHOOK: ${{ secrets.PVP_DISCORD_WEBHOOK }}
           API_BASE: ${{ secrets.API_BASE }}
           COOKIE_NAME: ${{ secrets.COOKIE_NAME }}
           SESSION_COOKIE: ${{ secrets.SESSION_COOKIE }}

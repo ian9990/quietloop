@@ -18,6 +18,7 @@ always-on machine. In this repo's Settings -> Secrets and variables -> Actions,
 add these repository secrets:
 
 - `DISCORD_WEBHOOK`
+- `PVP_DISCORD_WEBHOOK` (optional -- separate channel for PVP top-rank alerts)
 - `API_BASE`
 - `COOKIE_NAME`
 - `SESSION_COOKIE`

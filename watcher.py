@@ -84,6 +84,11 @@ logger.addHandler(_file_handler)
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
+# Separate webhook/channel for top-PVP-rank alerts -- optional; that
+# feature is simply skipped (logged once, not an error) if unset, same as
+# every other optional piece of this script.
+PVP_DISCORD_WEBHOOK = os.environ.get("PVP_DISCORD_WEBHOOK")
+
 # The exact cookie name your target deployment uses -- check your browser's
 # devtools (Network tab -> any API request -> Cookie header) for the name
 # it sends. No hardcoded default here since it varies by deployment.
@@ -179,6 +184,7 @@ TRACKED_STATE_PATH = "tracked_state.json"
 ICON_BASE = "https://raw.githubusercontent.com/WatWowMap/wwm-uicons/main/pokemon"
 
 ALERT_COLOR = 0xE74C3C
+PVP_ALERT_COLOR = 0xF1C40F
 
 # The API's `weather` field is aliased server-side from a
 # weather-boost-condition column -- 0/null means not boosted, any other
@@ -352,6 +358,60 @@ FILTERS_PAYLOAD = {
     },
 }
 
+# Separate filter for the PVP top-rank alert -- confirmed live this is a
+# largely disjoint set from FILTERS_PAYLOAD above (a 100%-match record is
+# almost never also a top PVP rank, since PVP ranking favors specific
+# lower/mid stat combos under a league's CP cap), so this flips
+# onlyHundoIv off and onlyPvp on rather than trying to merge both
+# conditions into one filter. onlyIv is deliberately left True (matching
+# the confirmed-working baseline) with its range widened to [0, 100] (no
+# restriction), and the little/great/ultra ranges narrowed to
+# [1, PVP_RANK_THRESHOLD] as a server-side hint -- still re-verified
+# client-side in extract_top_pvp_ranks(), same "never trust the server
+# filter alone" rule as FILTERS_PAYLOAD above.
+PVP_RANK_THRESHOLD = 3
+
+PVP_FILTERS_PAYLOAD = {
+    "onlyLegacy": False,
+    "onlyLinkGlobal": True,
+    "onlyAllPvp": False,
+    "onlyAreas": [],
+    "onlyEasyMode": True,
+    "onlyOnlyShowAvailable": True,
+    "onlyIv": True,
+    "onlyPvp": True,
+    "onlyGender": 0,
+    "onlyZeroIv": False,
+    "onlyHundoIv": False,
+    "onlyPvpMega": False,
+    "onlyPvp50": False,
+    "onlyPvp51": False,
+    "onlyIvOr": {
+        "enabled": True,
+        "size": "md",
+        "all": False,
+        "adv": "",
+        "iv": [0, 100],
+        "atk_iv": [0, 15],
+        "def_iv": [0, 15],
+        "sta_iv": [0, 15],
+        "level": [1, 55],
+        "cp": [10, 5000],
+        "gender": 0,
+        "xxs": False,
+        "xxl": False,
+        "little": [1, PVP_RANK_THRESHOLD],
+        "great": [1, PVP_RANK_THRESHOLD],
+        "ultra": [1, PVP_RANK_THRESHOLD],
+    },
+}
+
+PVP_LEAGUE_LABELS = {
+    "little": "Little League",
+    "great": "Great League",
+    "ultra": "Ultra League",
+}
+
 # ---------------------------------------------------------------------------
 # CATALOG (id -> display name lookup -- public, no auth needed)
 # ---------------------------------------------------------------------------
@@ -509,12 +569,11 @@ def reverse_geocode(lat, lon):
 class SessionExpiredError(Exception):
     pass
 
-def query_target_entries():
-    """POSTs the configured query for the configured bounding box and
-    returns the list of entries in the response (already server-side
-    filtered by FILTERS_PAYLOAD's onlyHundoIv flag -- but callers should
-    treat that as a hint, not a guarantee, and can re-check the target
-    condition themselves if being defensive)."""
+def _query_entries(filters):
+    """Shared POST + error-handling logic for both queries below -- only
+    the `filters` payload differs between the target-match query and the
+    PVP top-rank query, everything else (endpoint, headers, error
+    handling) is identical."""
     if not SESSION_COOKIE:
         raise RuntimeError(
             "SESSION_COOKIE (and COOKIE_NAME) not set -- see setup instructions at top of file."
@@ -529,7 +588,7 @@ def query_target_entries():
             "maxLat": MAX_LAT,
             "minLon": MIN_LON,
             "maxLon": MAX_LON,
-            "filters": FILTERS_PAYLOAD,
+            "filters": filters,
         },
         "query": RECORDS_QUERY,
     }
@@ -566,6 +625,51 @@ def query_target_entries():
 
     return data.get("data", {}).get("pokemon", []) or []
 
+def query_target_entries():
+    """Returns the list of entries in the response, already server-side
+    filtered by FILTERS_PAYLOAD's onlyHundoIv flag -- but callers should
+    treat that as a hint, not a guarantee, and can re-check the target
+    condition themselves if being defensive."""
+    return _query_entries(FILTERS_PAYLOAD)
+
+def query_pvp_entries():
+    """Returns the list of entries in the response, already server-side
+    filtered by PVP_FILTERS_PAYLOAD's per-league rank range -- same
+    "hint, not a guarantee" caveat as query_target_entries() above; callers
+    should re-verify with extract_top_pvp_ranks()."""
+    return _query_entries(PVP_FILTERS_PAYLOAD)
+
+def extract_top_pvp_ranks(record, threshold=PVP_RANK_THRESHOLD):
+    """Returns {league_key: entry} for each league where THIS record's own
+    species+form (not a hypothetical evolution) ranks <= threshold.
+
+    `cleanPvp[league]` is a list of ranking entries -- confirmed live it can
+    include entries for species other than the record itself (e.g. what it
+    could evolve into), each with its own `pokemon`/`form`/`rank`. Only the
+    entry matching this exact record's `pokemon_id`/`form` is relevant here;
+    a hypothetical evolution ranking top-3 isn't what's actually sitting on
+    the map right now. `form` is omitted from an entry when it's 0 (per the
+    underlying ranking library's convention), so both sides are normalized
+    to 0 before comparing."""
+    clean_pvp = record.get("cleanPvp") or {}
+    rid = record.get("pokemon_id")
+    form = record.get("form") or 0
+
+    results = {}
+    for league, entries in clean_pvp.items():
+        if league not in PVP_LEAGUE_LABELS or not entries:
+            continue
+        for entry in entries:
+            if entry.get("pokemon") != rid:
+                continue
+            if (entry.get("form") or 0) != form:
+                continue
+            rank = entry.get("rank")
+            if rank is not None and rank <= threshold:
+                results[league] = entry
+            break  # at most one entry per species+form per league
+    return results
+
 # ---------------------------------------------------------------------------
 # DISCORD
 # ---------------------------------------------------------------------------
@@ -583,25 +687,28 @@ def send_discord_text(message):
     except requests.RequestException as e:
         logger.warning(f"Failed to send Discord alert: {e}")
 
-def send_discord_embed(embed, image_bytes=None, image_filename=None):
-    """Posts a single embed. If image_bytes is given, sends it as a
-    multipart file attachment alongside the embed (embed['image']['url']
-    must already be set to 'attachment://{image_filename}' by the caller)
-    rather than a plain JSON POST -- Discord webhooks only accept file
-    attachments via multipart form data."""
-    if not DISCORD_WEBHOOK:
-        logger.error("DISCORD_WEBHOOK not set -- cannot send alert. See setup instructions at top of file.")
+def send_discord_embed(embed, image_bytes=None, image_filename=None, webhook=None):
+    """Posts a single embed to `webhook` (defaults to DISCORD_WEBHOOK, but
+    the PVP alert path passes PVP_DISCORD_WEBHOOK to route to a separate
+    channel). If image_bytes is given, sends it as a multipart file
+    attachment alongside the embed (embed['image']['url'] must already be
+    set to 'attachment://{image_filename}' by the caller) rather than a
+    plain JSON POST -- Discord webhooks only accept file attachments via
+    multipart form data."""
+    webhook = webhook or DISCORD_WEBHOOK
+    if not webhook:
+        logger.error("No Discord webhook set -- cannot send alert. See setup instructions at top of file.")
         return
     try:
         if image_bytes is not None:
             resp = requests.post(
-                DISCORD_WEBHOOK,
+                webhook,
                 data={"payload_json": json.dumps({"embeds": [embed]})},
                 files={"files[0]": (image_filename, image_bytes, "image/png")},
                 timeout=20,
             )
         else:
-            resp = requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=15)
+            resp = requests.post(webhook, json={"embeds": [embed]}, timeout=15)
         if resp.status_code >= 300:
             logger.warning(f"Discord embed alert returned status {resp.status_code}: {resp.text[:200]}")
         else:
@@ -675,6 +782,92 @@ def send_alert(record):
             return
     send_discord_embed(embed)
 
+def format_pvp_embed(record, qualifying_leagues):
+    """Same overall shape as format_embed() (illustrative thumbnail,
+    weather, gender, expiry, location), but for the separate PVP-rank
+    alert: shows the record's current/as-caught CP+level and Atk/Def/Sta
+    breakdown (not the overall match %, which isn't useful once the
+    breakdown is shown) so a player can actually match this alert to the
+    entry on their own map, plus a field per qualifying league with its
+    rank/percentage and the CP/level to power up TO in order to realize
+    that rank (that target CP/level is what the ranking entry itself
+    reports, which is generally NOT the same as the record's current
+    as-caught CP/level shown above)."""
+    name = describe_entry(record.get("pokemon_id"), record.get("form"))
+    cp = record.get("cp")
+    level = record.get("level")
+    atk, defe, sta = record.get("atk_iv"), record.get("def_iv"), record.get("sta_iv")
+    weather = record.get("weather")
+    gender = record.get("gender")
+    expire_ts = record.get("expire_timestamp")
+    lat, lon = record.get("lat"), record.get("lon")
+
+    fields = []
+    if cp is not None and level is not None:
+        fields.append({"name": "Current CP / Level", "value": f"{cp} / L{level}", "inline": True})
+    if atk is not None and defe is not None and sta is not None:
+        fields.append({"name": "IVs (Atk/Def/Sta)", "value": f"{atk}/{defe}/{sta}", "inline": True})
+    if gender in GENDER_LABELS:
+        fields.append({"name": "Gender", "value": GENDER_LABELS[gender], "inline": True})
+    if weather:
+        emoji = WEATHER_EMOJI.get(weather, "✨")
+        fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
+    else:
+        fields.append({"name": "Weather Boost", "value": "No", "inline": True})
+    for league in ("little", "great", "ultra"):
+        entry = qualifying_leagues.get(league)
+        if not entry:
+            continue
+        rank = entry.get("rank")
+        pct = entry.get("percentage")
+        pct_str = f"{pct * 100:.1f}%" if pct is not None else "?"
+        fields.append({
+            "name": f"\U0001F3C6 {PVP_LEAGUE_LABELS[league]}",
+            "value": f"Rank #{rank} ({pct_str}) -- power up to CP {entry.get('cp')} @ L{entry.get('level')}",
+            "inline": False,
+        })
+    if expire_ts:
+        ts = int(expire_ts)
+        fields.append({"name": "Despawns", "value": f"<t:{ts}:R> -- <t:{ts}:T>", "inline": False})
+    if lat is not None and lon is not None:
+        maps_url = f"https://maps.google.com/?q={lat},{lon}"
+        address = reverse_geocode(lat, lon)
+        location_lines = [address] if address else []
+        location_lines.append(f"`{lat:.5f}, {lon:.5f}`")
+        location_lines.append(f"[Open in Google Maps]({maps_url})")
+        fields.append({"name": "Location", "value": "\n".join(location_lines), "inline": False})
+
+    # Concise "rank + league" title (e.g. "Little League #2", or
+    # "Little League #2 / Great League #1" if it qualifies in more than
+    # one) -- states the actual rank(s) rather than a vaguer "top N" label.
+    rank_bits = [
+        f"{PVP_LEAGUE_LABELS[league]} #{entry.get('rank')}"
+        for league, entry in qualifying_leagues.items()
+        if league in PVP_LEAGUE_LABELS
+    ]
+    embed = {
+        "title": f"\U0001F3C6 {name} -- {' / '.join(rank_bits)}",
+        "color": PVP_ALERT_COLOR,
+        "fields": fields,
+    }
+    icon_url = build_icon_url(record)
+    if icon_url:
+        embed["thumbnail"] = {"url": icon_url}
+    return embed
+
+def send_pvp_alert(record, qualifying_leagues):
+    """Same single-post-with-attached-map-image pattern as send_alert(),
+    but posted to PVP_DISCORD_WEBHOOK instead."""
+    embed = format_pvp_embed(record, qualifying_leagues)
+    lat, lon = record.get("lat"), record.get("lon")
+    if lat is not None and lon is not None:
+        map_bytes = build_location_map_image(lat, lon)
+        if map_bytes is not None:
+            embed["image"] = {"url": f"attachment://{MAP_ATTACHMENT_FILENAME}"}
+            send_discord_embed(embed, image_bytes=map_bytes, image_filename=MAP_ATTACHMENT_FILENAME, webhook=PVP_DISCORD_WEBHOOK)
+            return
+    send_discord_embed(embed, webhook=PVP_DISCORD_WEBHOOK)
+
 # ---------------------------------------------------------------------------
 # TRACKING (dedup alerts across polls)
 # ---------------------------------------------------------------------------
@@ -684,6 +877,14 @@ def send_alert(record):
 
 tracked_ids = {}  # id -> expire_timestamp
 
+# Separate from tracked_ids above -- a record could be a target match AND
+# (in principle) also qualify for the PVP alert, and these get sent to
+# different channels, so they're tracked independently rather than sharing
+# one dedup set. A single combined post covers however many leagues a
+# record qualifies for at once (see extract_top_pvp_ranks), so this only
+# needs one entry per record id, not one per (id, league).
+tracked_pvp_ids = {}  # id -> expire_timestamp
+
 def prune_tracked_ids(now):
     expired = [pid for pid, exp in tracked_ids.items() if now > exp + FORGET_AFTER_EXPIRY]
     for pid in expired:
@@ -691,25 +892,36 @@ def prune_tracked_ids(now):
     if expired:
         logger.debug(f"Forgot {len(expired)} expired match(es) from tracking.")
 
+def prune_tracked_pvp_ids(now):
+    expired = [pid for pid, exp in tracked_pvp_ids.items() if now > exp + FORGET_AFTER_EXPIRY]
+    for pid in expired:
+        del tracked_pvp_ids[pid]
+    if expired:
+        logger.debug(f"Forgot {len(expired)} expired PVP match(es) from tracking.")
+
 def load_tracked_state():
-    """Restores tracked_ids from disk if a state file from a previous run
-    exists -- see TRACKED_STATE_PATH above for why this matters.
-    Missing/corrupt file just means starting fresh (not fatal; worst case
-    is a handful of re-alerts, same as before this existed)."""
+    """Restores tracked_ids/tracked_pvp_ids from disk if a state file from
+    a previous run exists -- see TRACKED_STATE_PATH above for why this
+    matters. Missing/corrupt file just means starting fresh (not fatal;
+    worst case is a handful of re-alerts, same as before this existed)."""
     if not os.path.exists(TRACKED_STATE_PATH):
         return
     try:
         with open(TRACKED_STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
         tracked_ids.update(state.get("tracked_ids", {}))
-        logger.info(f"Restored tracked state from disk: {len(tracked_ids)} id(s).")
+        tracked_pvp_ids.update(state.get("tracked_pvp_ids", {}))
+        logger.info(
+            f"Restored tracked state from disk: {len(tracked_ids)} id(s), "
+            f"{len(tracked_pvp_ids)} PVP id(s)."
+        )
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Failed to load {TRACKED_STATE_PATH}: {e} -- starting with empty tracking.")
 
 def save_tracked_state():
     try:
         with open(TRACKED_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"tracked_ids": tracked_ids}, f)
+            json.dump({"tracked_ids": tracked_ids, "tracked_pvp_ids": tracked_pvp_ids}, f)
     except OSError as e:
         logger.warning(f"Failed to save {TRACKED_STATE_PATH}: {e}")
 
@@ -739,6 +951,10 @@ def main():
     load_tracked_state()
     logger.info("Starting watcher.")
     logger.info(f"Bounding box: ({MIN_LAT},{MIN_LON}) to ({MAX_LAT},{MAX_LON}), polling every {POLL_INTERVAL}s.")
+    if PVP_DISCORD_WEBHOOK:
+        logger.info(f"PVP top-{PVP_RANK_THRESHOLD} alerts enabled (separate webhook).")
+    else:
+        logger.info("PVP_DISCORD_WEBHOOK not set -- PVP top-rank alerts disabled.")
     if MAX_RUNTIME_SECONDS:
         logger.info(f"Will exit cleanly after ~{int(MAX_RUNTIME_SECONDS)}s (MAX_RUNTIME_SECONDS set).")
 
@@ -795,6 +1011,41 @@ def main():
             logger.debug(f"No new matches this cycle ({len(tracked_ids)} tracked).")
 
         prune_tracked_ids(now)
+
+        # PVP top-rank alerts -- separate query/filter/webhook/tracking
+        # from the target-match alert above. Entirely optional: skipped
+        # gracefully if PVP_DISCORD_WEBHOOK isn't set.
+        if PVP_DISCORD_WEBHOOK:
+            try:
+                pvp_candidates = query_pvp_entries()
+            except SessionExpiredError:
+                pvp_candidates = []  # already alerted above for the main query's failure
+            except (requests.RequestException, RuntimeError) as e:
+                logger.error(f"PVP query failed: {e}")
+                pvp_candidates = []
+
+            pvp_new_count = 0
+            for record in pvp_candidates:
+                rid = record.get("id")
+                if rid is None or rid in tracked_pvp_ids:
+                    continue
+                qualifying_leagues = extract_top_pvp_ranks(record)
+                if not qualifying_leagues:
+                    continue  # server-side hint didn't hold up client-side -- skip
+                tracked_pvp_ids[rid] = record.get("expire_timestamp", now + 3600)
+                pvp_new_count += 1
+                logger.info(
+                    f"New top-{PVP_RANK_THRESHOLD} PVP match: "
+                    f"{describe_entry(record.get('pokemon_id'), record.get('form'))} "
+                    f"({'/'.join(qualifying_leagues)}) (id={rid})"
+                )
+                send_pvp_alert(record, qualifying_leagues)
+
+            if pvp_new_count == 0:
+                logger.debug(f"No new top-PVP matches this cycle ({len(tracked_pvp_ids)} tracked).")
+
+            prune_tracked_pvp_ids(now)
+
         save_tracked_state()
         time.sleep(POLL_INTERVAL)
 

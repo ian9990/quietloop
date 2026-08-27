@@ -611,7 +611,17 @@ def _query_entries(filters):
 
     resp = requests.post(GRAPHQL_URL, json=body, headers=headers, timeout=30)
 
-    if resp.status_code in (401, 403):
+    # 511 is the target deployment's actual real-world signal for an
+    # expired session (a deliberate app-level GraphQL error, not a generic
+    # network failure) -- confirmed live, repeatedly, that THIS is the
+    # status code that actually shows up, not 401/403. Missing it here was
+    # a real bug: resp.raise_for_status() below throws a plain HTTPError
+    # for any unhandled 4xx/5xx BEFORE the GraphQL errors-array check
+    # further down ever runs, so a 511 was silently falling into the
+    # generic "query failed" handler in main() -- logged, but with no
+    # Discord alert, exactly the failure mode this whole
+    # SessionExpiredError path exists to prevent.
+    if resp.status_code in (401, 403, 511):
         raise SessionExpiredError(f"HTTP {resp.status_code} -- session cookie likely expired.")
 
     resp.raise_for_status()

@@ -19,10 +19,12 @@ add these repository secrets:
 
 - `DISCORD_WEBHOOK`
 - `PVP_DISCORD_WEBHOOK` (optional -- separate channel for PVP top-rank alerts)
+- `ZONE_WEBHOOK` (optional -- separate channel mirroring alerts inside a smaller bbox)
 - `API_BASE`
 - `COOKIE_NAME`
 - `SESSION_COOKIE`
 - `MIN_LAT`, `MAX_LAT`, `MIN_LON`, `MAX_LON`
+- `ZONE_MIN_LAT`, `ZONE_MAX_LAT`, `ZONE_MIN_LON`, `ZONE_MAX_LON` (required if `ZONE_WEBHOOK` is set)
 
 The session cookie will expire eventually and need to be refreshed in the
 `SESSION_COOKIE` secret.

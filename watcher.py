@@ -22,6 +22,11 @@ Optional: MAX_RUNTIME_SECONDS has main() exit cleanly after N seconds
 instead of running forever (see its definition below for why -- useful for
 hosting on a platform with a max job runtime, e.g. GitHub Actions).
 
+Optional: to also mirror match alerts for a specific sub-area to a second
+Discord channel, set ZONE_WEBHOOK plus ZONE_MIN_LAT/ZONE_MAX_LAT/
+ZONE_MIN_LON/ZONE_MAX_LON (a bbox nested inside MIN_LAT/MAX_LAT/MIN_LON/
+MAX_LON above).
+
 LOGS:
 Console shows INFO+, full DEBUG log written to watcher.log in this folder.
 """
@@ -145,6 +150,19 @@ MIN_LAT = _float_env("MIN_LAT")
 MAX_LAT = _float_env("MAX_LAT")
 MIN_LON = _float_env("MIN_LON")
 MAX_LON = _float_env("MAX_LON")
+
+# Optional: mirror a match alert to a second webhook whenever the record's
+# coordinates fall inside this smaller "zone" bbox nested within the main
+# search area above -- e.g. a specific neighborhood you want pinged to its
+# own, more focused channel, without splitting it into a separate watcher.
+# Entirely optional: skipped (logged once, not an error) if the webhook
+# isn't set; if it IS set, all four bounds must also be set (checked in
+# main()) since a webhook with no bbox has nothing to test against.
+ZONE_WEBHOOK = os.environ.get("ZONE_WEBHOOK")
+ZONE_MIN_LAT = _float_env("ZONE_MIN_LAT")
+ZONE_MAX_LAT = _float_env("ZONE_MAX_LAT")
+ZONE_MIN_LON = _float_env("ZONE_MIN_LON")
+ZONE_MAX_LON = _float_env("ZONE_MAX_LON")
 
 # The target site's own frontend polls every 60s (confirmed via devtools)
 # -- matching that cadence rather than polling faster than the underlying
@@ -365,10 +383,15 @@ FILTERS_PAYLOAD = {
 # onlyHundoIv off and onlyPvp on rather than trying to merge both
 # conditions into one filter. onlyIv is deliberately left True (matching
 # the confirmed-working baseline) with its range widened to [0, 100] (no
-# restriction), and the little/great/ultra ranges narrowed to
+# restriction), and the great/ultra ranges narrowed to
 # [1, PVP_RANK_THRESHOLD] as a server-side hint -- still re-verified
 # client-side in extract_top_pvp_ranks(), same "never trust the server
-# filter alone" rule as FILTERS_PAYLOAD above.
+# filter alone" rule as FILTERS_PAYLOAD above. Little League is
+# deliberately left at [1, 1] (i.e. not hinted/requested) -- per user
+# feedback it was the league qualifying most often by far and the results
+# were the least useful, so it's dropped from this alert entirely; see
+# PVP_LEAGUE_LABELS below, which is what actually excludes it (the
+# server-side hint here is just secondary cleanup).
 PVP_RANK_THRESHOLD = 3
 
 PVP_FILTERS_PAYLOAD = {
@@ -400,14 +423,16 @@ PVP_FILTERS_PAYLOAD = {
         "gender": 0,
         "xxs": False,
         "xxl": False,
-        "little": [1, PVP_RANK_THRESHOLD],
+        "little": [1, 1],
         "great": [1, PVP_RANK_THRESHOLD],
         "ultra": [1, PVP_RANK_THRESHOLD],
     },
 }
 
+# Little League intentionally excluded here (see PVP_RANK_THRESHOLD comment
+# above) -- extract_top_pvp_ranks() only keeps leagues present in this dict,
+# so a record ranking top-3 in Little League alone simply won't qualify.
 PVP_LEAGUE_LABELS = {
-    "little": "Little League",
     "great": "Great League",
     "ultra": "Ultra League",
 }
@@ -486,6 +511,9 @@ def build_icon_url(record):
         except requests.RequestException:
             continue
     return None
+
+def point_in_bbox(lat, lon, min_lat, max_lat, min_lon, max_lon):
+    return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
 
 def _deg2tile_float(lat, lon, zoom):
     """Slippy-map projection (standard OSM tile math): returns fractional
@@ -781,16 +809,31 @@ def send_alert(record):
     """Builds the embed and, if coordinates are available, a locally
     composited OSM map preview centered on the record -- sent together as
     one multipart post (embed['image'] pointing at the attached file) so
-    the whole alert lands as a single Discord message."""
+    the whole alert lands as a single Discord message. If ZONE_WEBHOOK is
+    configured and this record's coordinates fall inside the zone bbox, the
+    same embed (and map image, reusing the same fetched bytes rather than
+    fetching twice) is also mirrored there as a second, independent post."""
     embed = format_embed(record)
     lat, lon = record.get("lat"), record.get("lon")
+    map_bytes = None
     if lat is not None and lon is not None:
         map_bytes = build_location_map_image(lat, lon)
         if map_bytes is not None:
             embed["image"] = {"url": f"attachment://{MAP_ATTACHMENT_FILENAME}"}
-            send_discord_embed(embed, image_bytes=map_bytes, image_filename=MAP_ATTACHMENT_FILENAME)
-            return
-    send_discord_embed(embed)
+
+    if map_bytes is not None:
+        send_discord_embed(embed, image_bytes=map_bytes, image_filename=MAP_ATTACHMENT_FILENAME)
+    else:
+        send_discord_embed(embed)
+
+    zone_bounds = (ZONE_MIN_LAT, ZONE_MAX_LAT, ZONE_MIN_LON, ZONE_MAX_LON)
+    if (ZONE_WEBHOOK and lat is not None and lon is not None
+            and None not in zone_bounds and point_in_bbox(lat, lon, *zone_bounds)):
+        logger.info("Record falls inside the zone bbox -- mirroring alert to ZONE_WEBHOOK.")
+        if map_bytes is not None:
+            send_discord_embed(embed, image_bytes=map_bytes, image_filename=MAP_ATTACHMENT_FILENAME, webhook=ZONE_WEBHOOK)
+        else:
+            send_discord_embed(embed, webhook=ZONE_WEBHOOK)
 
 def format_pvp_embed(record, qualifying_leagues):
     """Same overall shape as format_embed() (illustrative thumbnail,
@@ -824,7 +867,7 @@ def format_pvp_embed(record, qualifying_leagues):
         fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
     else:
         fields.append({"name": "Weather Boost", "value": "No", "inline": True})
-    for league in ("little", "great", "ultra"):
+    for league in ("great", "ultra"):
         entry = qualifying_leagues.get(league)
         if not entry:
             continue
@@ -847,8 +890,8 @@ def format_pvp_embed(record, qualifying_leagues):
         location_lines.append(f"[Open in Google Maps]({maps_url})")
         fields.append({"name": "Location", "value": "\n".join(location_lines), "inline": False})
 
-    # Concise "rank + league" title (e.g. "Little League #2", or
-    # "Little League #2 / Great League #1" if it qualifies in more than
+    # Concise "rank + league" title (e.g. "Great League #2", or
+    # "Great League #2 / Ultra League #1" if it qualifies in more than
     # one) -- states the actual rank(s) rather than a vaguer "top N" label.
     rank_bits = [
         f"{PVP_LEAGUE_LABELS[league]} #{entry.get('rank')}"
@@ -956,6 +999,12 @@ def main():
             "(your area of interest) -- see setup instructions at top of file."
         )
         return
+    if ZONE_WEBHOOK and None in (ZONE_MIN_LAT, ZONE_MAX_LAT, ZONE_MIN_LON, ZONE_MAX_LON):
+        logger.error(
+            "ZONE_WEBHOOK is set but ZONE_MIN_LAT/MAX_LAT/MIN_LON/MAX_LON "
+            "aren't all set -- a zone webhook needs all four bounds to test against."
+        )
+        return
 
     load_catalog()
     load_tracked_state()
@@ -965,6 +1014,13 @@ def main():
         logger.info(f"PVP top-{PVP_RANK_THRESHOLD} alerts enabled (separate webhook).")
     else:
         logger.info("PVP_DISCORD_WEBHOOK not set -- PVP top-rank alerts disabled.")
+    if ZONE_WEBHOOK:
+        logger.info(
+            f"Zone mirroring enabled: matches in ({ZONE_MIN_LAT},{ZONE_MIN_LON}) to "
+            f"({ZONE_MAX_LAT},{ZONE_MAX_LON}) also post to ZONE_WEBHOOK."
+        )
+    else:
+        logger.info("ZONE_WEBHOOK not set -- zone-mirrored alerts disabled.")
     if MAX_RUNTIME_SECONDS:
         logger.info(f"Will exit cleanly after ~{int(MAX_RUNTIME_SECONDS)}s (MAX_RUNTIME_SECONDS set).")
 

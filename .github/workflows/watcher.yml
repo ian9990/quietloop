@@ -57,5 +57,10 @@ jobs:
           MAX_LAT: ${{ secrets.MAX_LAT }}
           MIN_LON: ${{ secrets.MIN_LON }}
           MAX_LON: ${{ secrets.MAX_LON }}
+          ZONE_WEBHOOK: ${{ secrets.ZONE_WEBHOOK }}
+          ZONE_MIN_LAT: ${{ secrets.ZONE_MIN_LAT }}
+          ZONE_MAX_LAT: ${{ secrets.ZONE_MAX_LAT }}
+          ZONE_MIN_LON: ${{ secrets.ZONE_MIN_LON }}
+          ZONE_MAX_LON: ${{ secrets.ZONE_MAX_LON }}
           MAX_RUNTIME_SECONDS: "20700"
         run: python watcher.py

@@ -132,6 +132,15 @@ SESSION_COOKIE = normalize_session_cookie(os.environ.get("SESSION_COOKIE"))
 API_BASE = os.environ.get("API_BASE")
 GRAPHQL_URL = f"{API_BASE}/graphql" if API_BASE else None
 
+# Sent as the apollographql-client-version request header -- confirmed live
+# the server rejects a stale value outright (HTTP 464, GraphQLError
+# "old_client"/BAD_USER_INPUT, with its current version in the error's
+# `serverV` field) rather than just ignoring it, so this has to be bumped
+# by hand whenever the target deployment ships a new client build. See
+# ClientVersionOutdatedError below for how that failure is now surfaced
+# instead of silently erroring every cycle.
+APOLLO_CLIENT_VERSION = "1.36.0-develop.13"
+
 def _float_env(name):
     """Returns None (not a hardcoded default) if unset/invalid -- the
     bounding box is inherently specific to your area of interest, so
@@ -597,6 +606,9 @@ def reverse_geocode(lat, lon):
 class SessionExpiredError(Exception):
     pass
 
+class ClientVersionOutdatedError(Exception):
+    pass
+
 def _query_entries(filters):
     """Shared POST + error-handling logic for both queries below -- only
     the `filters` payload differs between the target-match query and the
@@ -626,7 +638,7 @@ def _query_entries(filters):
         "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/json",
         "apollographql-client-name": "watcher-client",
-        "apollographql-client-version": "1.36.0-develop.12",
+        "apollographql-client-version": APOLLO_CLIENT_VERSION,
         "Origin": API_BASE,
         "Referer": f"{API_BASE}/",
         "Sec-Fetch-Dest": "empty",
@@ -651,6 +663,27 @@ def _query_entries(filters):
     # SessionExpiredError path exists to prevent.
     if resp.status_code in (401, 403, 511):
         raise SessionExpiredError(f"HTTP {resp.status_code} -- session cookie likely expired.")
+
+    # 464 is the target deployment's (equally non-standard) real-world
+    # signal for a stale apollographql-client-version header -- confirmed
+    # live via a direct GraphQLError body: {"message": "old_client",
+    # "extensions": {"clientV": "...", "serverV": "...", "code":
+    # "BAD_USER_INPUT"}}. Same shape of bug as the 511 case above:
+    # resp.raise_for_status() would otherwise throw a plain HTTPError here
+    # and this would silently land in main()'s generic "query failed"
+    # handler forever, with no alert, until someone happens to notice and
+    # go digging -- exactly what happened before this check was added (see
+    # HANDOFF.md in the private repo).
+    if resp.status_code == 464:
+        try:
+            server_version = resp.json()["errors"][0]["extensions"].get("serverV")
+        except (ValueError, KeyError, IndexError, TypeError):
+            server_version = None
+        hint = f" (server reports version {server_version})" if server_version else ""
+        raise ClientVersionOutdatedError(
+            f"HTTP 464 -- APOLLO_CLIENT_VERSION ({APOLLO_CLIENT_VERSION}) is stale{hint}; "
+            "update it in the script."
+        )
 
     resp.raise_for_status()
     data = resp.json()
@@ -1026,6 +1059,7 @@ def main():
 
     start_time = time.time()
     was_session_expired = False
+    was_client_outdated = False
     cycle = 0
     while True:
         if MAX_RUNTIME_SECONDS and (time.time() - start_time) >= MAX_RUNTIME_SECONDS:
@@ -1048,6 +1082,16 @@ def main():
                 was_session_expired = True
             time.sleep(POLL_INTERVAL)
             continue
+        except ClientVersionOutdatedError as e:
+            logger.error(f"Client version rejected by server: {e}")
+            if not was_client_outdated:
+                send_discord_text(
+                    "⚠️ Watcher: the server rejected APOLLO_CLIENT_VERSION as outdated -- "
+                    f"{e} (every poll will fail until this is fixed)."
+                )
+                was_client_outdated = True
+            time.sleep(POLL_INTERVAL)
+            continue
         except (requests.RequestException, RuntimeError) as e:
             logger.error(f"Query failed: {e}")
             time.sleep(POLL_INTERVAL)
@@ -1057,6 +1101,7 @@ def main():
             logger.info("Session cookie is working again.")
             send_discord_text("✅ Watcher: session cookie is working again.")
             was_session_expired = False
+        was_client_outdated = False
 
         confirmed_matches = [e for e in entries if e.get("iv") == 100]
         logger.debug(f"{len(confirmed_matches)}/{len(entries)} returned entries confirmed as a match.")
@@ -1084,7 +1129,7 @@ def main():
         if PVP_DISCORD_WEBHOOK:
             try:
                 pvp_candidates = query_pvp_entries()
-            except SessionExpiredError:
+            except (SessionExpiredError, ClientVersionOutdatedError):
                 pvp_candidates = []  # already alerted above for the main query's failure
             except (requests.RequestException, RuntimeError) as e:
                 logger.error(f"PVP query failed: {e}")

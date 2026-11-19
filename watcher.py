@@ -34,6 +34,9 @@ tab -> the relevant request -> Authorization header). Duplicate entries
 reported by both sources are suppressed (see find_existing_tracked_match);
 each alert's embed footer discreetly names which source actually caught
 it (PRIMARY_SOURCE_LABEL / SECONDARY_SOURCE_LABEL, both also optional).
+Optionally set SECONDARY_MIN_LAT/MAX_LAT/MIN_LON/MAX_LON (all four, or
+not at all) to query that source over a different, smaller bbox than
+MIN_LAT/MAX_LAT/MIN_LON/MAX_LON above.
 
 LOGS:
 Console shows INFO+, full DEBUG log written to watcher.log in this folder.
@@ -201,6 +204,17 @@ ZONE_MAX_LON = _float_env("ZONE_MAX_LON")
 SECONDARY_API_BASE = os.environ.get("SECONDARY_API_BASE")
 SECONDARY_SITE = os.environ.get("SECONDARY_SITE")
 SECONDARY_TOKEN = os.environ.get("SECONDARY_TOKEN")
+
+# Optional, separate (smaller) bbox to query the secondary source over
+# instead of the full MIN_LAT/MAX_LAT/MIN_LON/MAX_LON area -- e.g. if that
+# source's coverage/reliability is only trusted for part of the main area,
+# or querying the full area there just isn't wanted. Falls back to the
+# main bbox entirely if any of the four aren't set (the original
+# behavior).
+SECONDARY_MIN_LAT = _float_env("SECONDARY_MIN_LAT")
+SECONDARY_MAX_LAT = _float_env("SECONDARY_MAX_LAT")
+SECONDARY_MIN_LON = _float_env("SECONDARY_MIN_LON")
+SECONDARY_MAX_LON = _float_env("SECONDARY_MAX_LON")
 
 # The target site's own frontend polls every 60s (confirmed via devtools)
 # -- matching that cadence rather than polling faster than the underlying
@@ -824,21 +838,26 @@ def _normalize_secondary_entry(entry):
     }
 
 def query_secondary_entries():
-    """Queries the secondary source directly for target-condition entries
-    in the configured bounding box. Already server-side filtered the same
-    way the primary query is -- re-verified client-side the same way
-    query_target_entries() is, same "hint, not a guarantee" caution."""
+    """Queries the secondary source directly for target-condition entries,
+    over SECONDARY_MIN_LAT/MAX_LAT/MIN_LON/MAX_LON if all four are set,
+    otherwise the same bbox as the primary query. Already server-side
+    filtered the same way the primary query is -- re-verified client-side
+    the same way query_target_entries() is, same "hint, not a guarantee"
+    caution."""
     if not SECONDARY_TOKEN:
         raise RuntimeError("SECONDARY_TOKEN not set -- see setup instructions at top of file.")
     if not SECONDARY_API_BASE or not SECONDARY_SITE:
         raise RuntimeError("SECONDARY_API_BASE and SECONDARY_SITE must both be set.")
 
+    override_bounds = (SECONDARY_MIN_LAT, SECONDARY_MAX_LAT, SECONDARY_MIN_LON, SECONDARY_MAX_LON)
+    min_lat, max_lat, min_lon, max_lon = override_bounds if None not in override_bounds else (MIN_LAT, MAX_LAT, MIN_LON, MAX_LON)
+
     body = {
         "mode": "pokemon",
-        "n_lat": MAX_LAT,
-        "w_lng": MIN_LON,
-        "s_lat": MIN_LAT,
-        "e_lng": MAX_LON,
+        "n_lat": max_lat,
+        "w_lng": min_lon,
+        "s_lat": min_lat,
+        "e_lng": max_lon,
         "filters": {
             "pokemon_ids": [],
             "species_forms": [],
@@ -1320,7 +1339,13 @@ def main():
     else:
         logger.info("ZONE_WEBHOOK not set -- zone-mirrored alerts disabled.")
     if SECONDARY_TOKEN:
-        logger.info("Secondary source enabled.")
+        if None not in (SECONDARY_MIN_LAT, SECONDARY_MAX_LAT, SECONDARY_MIN_LON, SECONDARY_MAX_LON):
+            logger.info(
+                f"Secondary source enabled, over its own bbox "
+                f"({SECONDARY_MIN_LAT},{SECONDARY_MIN_LON}) to ({SECONDARY_MAX_LAT},{SECONDARY_MAX_LON})."
+            )
+        else:
+            logger.info("Secondary source enabled, over the main bbox.")
     else:
         logger.info("SECONDARY_TOKEN not set -- secondary source disabled.")
     if MAX_RUNTIME_SECONDS:

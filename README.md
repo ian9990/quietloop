@@ -26,6 +26,7 @@ add these repository secrets:
 - `MIN_LAT`, `MAX_LAT`, `MIN_LON`, `MAX_LON`
 - `ZONE_MIN_LAT`, `ZONE_MAX_LAT`, `ZONE_MIN_LON`, `ZONE_MAX_LON` (required if `ZONE_WEBHOOK` is set)
 - `SECONDARY_API_BASE`, `SECONDARY_SITE`, `SECONDARY_TOKEN` (optional -- a second, independent data source; alerts are deduped against the primary source)
+- `SECONDARY_MIN_LAT`, `SECONDARY_MAX_LAT`, `SECONDARY_MIN_LON`, `SECONDARY_MAX_LON` (optional -- queries the secondary source over a different bbox than `MIN_LAT`/`MAX_LAT`/`MIN_LON`/`MAX_LON`; all four or none)
 - `PRIMARY_SOURCE_LABEL`, `SECONDARY_SOURCE_LABEL` (optional -- shown in each alert's footer so you can tell which source caught it)
 
 The session cookie will expire eventually and need to be refreshed in the

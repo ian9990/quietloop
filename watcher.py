@@ -27,6 +27,14 @@ Discord channel, set ZONE_WEBHOOK plus ZONE_MIN_LAT/ZONE_MAX_LAT/
 ZONE_MIN_LON/ZONE_MAX_LON (a bbox nested inside MIN_LAT/MAX_LAT/MIN_LON/
 MAX_LON above).
 
+Optional: to also pull matches from a second, independent data source, set
+SECONDARY_API_BASE, SECONDARY_SITE, and SECONDARY_TOKEN (a bearer token
+captured from that source's own browser session -- devtools -> Network
+tab -> the relevant request -> Authorization header). Duplicate entries
+reported by both sources are suppressed (see find_existing_tracked_match);
+each alert's embed footer discreetly names which source actually caught
+it (PRIMARY_SOURCE_LABEL / SECONDARY_SOURCE_LABEL, both also optional).
+
 LOGS:
 Console shows INFO+, full DEBUG log written to watcher.log in this folder.
 """
@@ -173,6 +181,27 @@ ZONE_MAX_LAT = _float_env("ZONE_MAX_LAT")
 ZONE_MIN_LON = _float_env("ZONE_MIN_LON")
 ZONE_MAX_LON = _float_env("ZONE_MAX_LON")
 
+# Optional second, entirely independent match data source -- its own
+# backend, own auth, own request/response shape and encounter-id scheme,
+# nothing shared with the primary deployment above except that both are
+# ultimately reporting the same real-world entries. Exists purely to
+# catch entries the primary source misses (or vice versa); cross-source
+# duplicate suppression happens in main()'s loop (see
+# find_existing_tracked_match), not here. Entirely optional: skipped
+# (logged once, not an error) if the token isn't set. No hardcoded
+# default for any of these three, same reasoning as API_BASE/COOKIE_NAME
+# above -- nothing about either target deployment lives in this file.
+# The token is a bearer value captured from that site's own browser
+# session (devtools -> Network tab -> the relevant request -> Authorization
+# header) -- no visible login flow to script, same "reuse a captured
+# session" approach as SESSION_COOKIE. Unknown how long it stays valid;
+# treated the same way -- see SecondaryAuthError below for how an expired
+# token surfaces as a one-shot Discord alert rather than silently erroring
+# every cycle.
+SECONDARY_API_BASE = os.environ.get("SECONDARY_API_BASE")
+SECONDARY_SITE = os.environ.get("SECONDARY_SITE")
+SECONDARY_TOKEN = os.environ.get("SECONDARY_TOKEN")
+
 # The target site's own frontend polls every 60s (confirmed via devtools)
 # -- matching that cadence rather than polling faster than the underlying
 # data updates.
@@ -245,6 +274,21 @@ GENDER_LABELS = {
     2: "♀️ Female",
     3: "⚪ Genderless",
 }
+
+# Discreet per-source attribution shown in each alert's embed footer (small
+# grey text, not part of the main content) -- lets you tell at a glance
+# which backend actually caught a given entry without cluttering the alert
+# itself, and without putting either deployment's actual name in the
+# committed code (configurable, like API_BASE/COOKIE_NAME above). A record
+# dict's "_source" key selects which label; absent (every dict straight
+# from the GraphQL query above) means the default/primary source.
+PRIMARY_SOURCE_LABEL = os.environ.get("PRIMARY_SOURCE_LABEL", "primary source")
+SECONDARY_SOURCE_LABEL = os.environ.get("SECONDARY_SOURCE_LABEL", "secondary source")
+SOURCE_LABELS = {
+    "primary": f"via {PRIMARY_SOURCE_LABEL}",
+    "secondary": f"via {SECONDARY_SOURCE_LABEL}",
+}
+DEFAULT_SOURCE = "primary"
 
 # Identifies this script to OpenStreetMap's tile server and Nominatim, per
 # both services' usage policies (they require a descriptive User-Agent, not
@@ -524,6 +568,17 @@ def build_icon_url(record):
 def point_in_bbox(lat, lon, min_lat, max_lat, min_lon, max_lon):
     return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
 
+def haversine_meters(lat1, lon1, lat2, lon2):
+    """Great-circle distance in meters -- used only for the cross-source
+    duplicate check below, where two backends reporting the same real
+    entry can report very slightly different approximate coordinates."""
+    r = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
 def _deg2tile_float(lat, lon, zoom):
     """Slippy-map projection (standard OSM tile math): returns fractional
     tile x/y so callers can find both which tile a point falls in and the
@@ -607,6 +662,9 @@ class SessionExpiredError(Exception):
     pass
 
 class ClientVersionOutdatedError(Exception):
+    pass
+
+class SecondaryAuthError(Exception):
     pass
 
 def _query_entries(filters):
@@ -710,6 +768,126 @@ def query_pvp_entries():
     should re-verify with extract_top_pvp_ranks()."""
     return _query_entries(PVP_FILTERS_PAYLOAD)
 
+# ---------------------------------------------------------------------------
+# SECONDARY SOURCE QUERY EXECUTION
+# ---------------------------------------------------------------------------
+# A completely separate backend from the primary deployment above -- own
+# auth, own request/response shape, own encounter-id scheme. Only a
+# target-match ("100%"-equivalent) mode is implemented; this source's own
+# API may support a PVP mode too, but no capture of that shape exists yet,
+# so it's not wired up here.
+
+# This source reports gender as a string rather than GENDER_LABELS' int --
+# translated to the same ints so every downstream function (format_embed,
+# etc.) works unchanged regardless of which source a record came from.
+SECONDARY_GENDER_IDS = {"Male": 1, "Female": 2, "Genderless": 3}
+
+def _normalize_secondary_entry(entry):
+    """Reshapes one secondary-source result into the same dict shape the
+    GraphQL query above returns (id, lat, lon, pokemon_id, form, gender,
+    expire_timestamp, iv, cp, level, atk_iv/def_iv/sta_iv), so every
+    existing function -- format_embed, build_icon_url, describe_entry,
+    tracking, etc. -- works on it without caring which source it came
+    from. Fields this source doesn't report (weather, cleanPvp) are left
+    out entirely rather than defaulted to a falsy value, so format_embed
+    can tell "not reported by this source" apart from "confirmed not
+    boosted" (see its weather handling)."""
+    atk = defe = sta = None
+    raw_iv = entry.get("raw_iv")
+    if raw_iv:
+        parts = raw_iv.split("/")
+        if len(parts) == 3:
+            try:
+                atk, defe, sta = (int(p) for p in parts)
+            except ValueError:
+                pass
+
+    despawn_ms = entry.get("despawn_at_ms")
+    iv_percent = entry.get("iv_percent")
+
+    return {
+        "id": entry.get("encounter_id"),
+        "lat": entry.get("apx_lat"),
+        "lon": entry.get("apx_long"),
+        "pokemon_id": entry.get("pokemon_id"),
+        "form": entry.get("form") or 0,
+        "costume": entry.get("costume"),
+        "gender": SECONDARY_GENDER_IDS.get(entry.get("gender")),
+        "expire_timestamp": despawn_ms / 1000 if despawn_ms else None,
+        "iv": int(iv_percent) if iv_percent is not None else None,
+        "cp": entry.get("cp"),
+        "level": int(entry["level"]) if entry.get("level") is not None else None,
+        "atk_iv": atk,
+        "def_iv": defe,
+        "sta_iv": sta,
+        "_source": "secondary",
+    }
+
+def query_secondary_entries():
+    """Queries the secondary source directly for target-condition entries
+    in the configured bounding box. Already server-side filtered the same
+    way the primary query is -- re-verified client-side the same way
+    query_target_entries() is, same "hint, not a guarantee" caution."""
+    if not SECONDARY_TOKEN:
+        raise RuntimeError("SECONDARY_TOKEN not set -- see setup instructions at top of file.")
+    if not SECONDARY_API_BASE or not SECONDARY_SITE:
+        raise RuntimeError("SECONDARY_API_BASE and SECONDARY_SITE must both be set.")
+
+    body = {
+        "mode": "pokemon",
+        "n_lat": MAX_LAT,
+        "w_lng": MIN_LON,
+        "s_lat": MIN_LAT,
+        "e_lng": MAX_LON,
+        "filters": {
+            "pokemon_ids": [],
+            "species_forms": [],
+            "blacklist_pokemon_ids": [],
+            "blacklist_species_forms": [],
+            "iv_min": 100,
+            "iv_max": None,
+            "cp_min": None,
+            "cp_max": None,
+            "level_min": None,
+            "level_max": None,
+            "gender": None,
+            "sizes": [],
+            "boosted": None,
+            "sort": "IV",
+            "pvp_mode": False,
+            "pvp_league": "great",
+            "pvp_top_rank": None,
+            "pvp_include_pre_evolutions": True,
+            "pvp_min_cp": None,
+            "shiny_only": False,
+            "shiny_account": None,
+            "background_only": False,
+            "always_show": [],
+        },
+        "num_results": 100,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": SECONDARY_SITE,
+        "Referer": f"{SECONDARY_SITE}/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "DNT": "1",
+        "Sec-GPC": "1",
+        "Authorization": f"Bearer {SECONDARY_TOKEN}",
+    }
+
+    resp = requests.post(f"{SECONDARY_API_BASE}/map/lookup", json=body, headers=headers, timeout=30)
+    if resp.status_code in (401, 403):
+        raise SecondaryAuthError(f"HTTP {resp.status_code} -- SECONDARY_TOKEN likely expired or invalid.")
+    resp.raise_for_status()
+    data = resp.json()
+    return [_normalize_secondary_entry(e) for e in data.get("results", []) or []]
+
 def extract_top_pvp_ranks(record, threshold=PVP_RANK_THRESHOLD):
     """Returns {league_key: entry} for each league where THIS record's own
     species+form (not a hypothetical evolution) ranks <= threshold.
@@ -812,11 +990,18 @@ def format_embed(record):
         fields.append({"name": "CP / Level", "value": f"{cp} / L{level}", "inline": True})
     if gender in GENDER_LABELS:
         fields.append({"name": "Gender", "value": GENDER_LABELS[gender], "inline": True})
-    if weather:
-        emoji = WEATHER_EMOJI.get(weather, "✨")
-        fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
-    else:
-        fields.append({"name": "Weather Boost", "value": "No", "inline": True})
+    # "weather" in record (not just record.get("weather")) distinguishes
+    # "this source reports weather and it's confirmed not boosted" (every
+    # GraphQL record dict always has the key, even when falsy) from "this
+    # source doesn't report weather at all" (secondary-source entries omit
+    # the key entirely) -- the latter shouldn't be shown as a confident
+    # "No".
+    if "weather" in record:
+        if weather:
+            emoji = WEATHER_EMOJI.get(weather, "✨")
+            fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
+        else:
+            fields.append({"name": "Weather Boost", "value": "No", "inline": True})
     if expire_ts:
         ts = int(expire_ts)
         fields.append({"name": "Expires", "value": f"<t:{ts}:R> -- <t:{ts}:T>", "inline": False})
@@ -832,6 +1017,7 @@ def format_embed(record):
         "title": f"\U0001F534 {name} -- {iv}% match",
         "color": ALERT_COLOR,
         "fields": fields,
+        "footer": {"text": SOURCE_LABELS.get(record.get("_source", DEFAULT_SOURCE), record.get("_source"))},
     }
     icon_url = build_icon_url(record)
     if icon_url:
@@ -895,11 +1081,12 @@ def format_pvp_embed(record, qualifying_leagues):
         fields.append({"name": "IVs (Atk/Def/Sta)", "value": f"{atk}/{defe}/{sta}", "inline": True})
     if gender in GENDER_LABELS:
         fields.append({"name": "Gender", "value": GENDER_LABELS[gender], "inline": True})
-    if weather:
-        emoji = WEATHER_EMOJI.get(weather, "✨")
-        fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
-    else:
-        fields.append({"name": "Weather Boost", "value": "No", "inline": True})
+    if "weather" in record:  # see format_embed()'s identical check for why
+        if weather:
+            emoji = WEATHER_EMOJI.get(weather, "✨")
+            fields.append({"name": "Weather Boost", "value": f"{emoji} Yes ({WEATHER_NAMES.get(weather, f'Unknown #{weather}')})", "inline": True})
+        else:
+            fields.append({"name": "Weather Boost", "value": "No", "inline": True})
     for league in ("great", "ultra"):
         entry = qualifying_leagues.get(league)
         if not entry:
@@ -935,6 +1122,7 @@ def format_pvp_embed(record, qualifying_leagues):
         "title": f"\U0001F3C6 {name} -- {' / '.join(rank_bits)}",
         "color": PVP_ALERT_COLOR,
         "fields": fields,
+        "footer": {"text": SOURCE_LABELS.get(record.get("_source", DEFAULT_SOURCE), record.get("_source"))},
     }
     icon_url = build_icon_url(record)
     if icon_url:
@@ -955,24 +1143,90 @@ def send_pvp_alert(record, qualifying_leagues):
     send_discord_embed(embed, webhook=PVP_DISCORD_WEBHOOK)
 
 # ---------------------------------------------------------------------------
-# TRACKING (dedup alerts across polls)
+# TRACKING (dedup alerts across polls -- and across data sources)
 # ---------------------------------------------------------------------------
 # Each match has a stable unique `id` and a known exact expire_timestamp --
 # much simpler than position-based tracking, which is what you'd need for
-# screen-scraped data with no stable identity.
-
-tracked_ids = {}  # id -> expire_timestamp
+# screen-scraped data with no stable identity. tracked_ids values are small
+# dicts, not bare timestamps, so a record seen from one source can still be
+# recognized when the OTHER source reports it too, even if the two sources
+# don't format/assign the same `id` for it -- see
+# find_existing_tracked_match() below for the actual cross-source matching
+# logic.
+tracked_ids = {}  # id -> {"expire": ts, "pokemon_id":, "form":, "lat":, "lon":}
 
 # Separate from tracked_ids above -- a record could be a target match AND
 # (in principle) also qualify for the PVP alert, and these get sent to
 # different channels, so they're tracked independently rather than sharing
 # one dedup set. A single combined post covers however many leagues a
 # record qualifies for at once (see extract_top_pvp_ranks), so this only
-# needs one entry per record id, not one per (id, league).
+# needs one entry per record id, not one per (id, league). Still plain
+# id -> expire_timestamp -- the PVP alert isn't wired up to the secondary
+# source (no PVP-mode capture of it exists yet), so there's no second
+# source to cross-match against here.
 tracked_pvp_ids = {}  # id -> expire_timestamp
 
+# How close two sources' reported coordinates/expiry times for what might
+# be the same real entry have to be to treat it as a duplicate rather than
+# a second, genuinely different entry. Generous on purpose: this is a
+# "probably the same entry" heuristic, not a precise one, and a missed
+# duplicate (double-alerting) is worse UX than an extremely unlikely false
+# merge of two different same-species entries that happen to be this close
+# together with near-identical expiry times.
+DEDUP_RADIUS_METERS = 50
+DEDUP_TIME_TOLERANCE_SECONDS = 120
+
+def find_existing_tracked_match(record):
+    """Returns the tracked_ids key already covering `record`, or None if
+    it looks genuinely new. Exact id match first (the common case, and the
+    only thing possible for entries with no known lat/lon); falls back to
+    same species+form, within DEDUP_RADIUS_METERS, with expiry times
+    within DEDUP_TIME_TOLERANCE_SECONDS of each other -- this is what
+    actually catches "two different sources reported the same real entry
+    under two different id strings" (unconfirmed whether that ever
+    happens in practice for this pair of sources, but cheap insurance:
+    the alternative is a silent duplicate post with no way to tell from
+    the alert alone that it already went out)."""
+    rid = record.get("id")
+    if rid is not None and rid in tracked_ids:
+        return rid
+
+    lat, lon = record.get("lat"), record.get("lon")
+    pkid = record.get("pokemon_id")
+    form = record.get("form") or 0
+    expire_ts = record.get("expire_timestamp")
+    if lat is None or lon is None:
+        return None
+
+    for tid, info in tracked_ids.items():
+        if info.get("pokemon_id") != pkid or (info.get("form") or 0) != form:
+            continue
+        t_lat, t_lon = info.get("lat"), info.get("lon")
+        if t_lat is None or t_lon is None:
+            continue
+        if haversine_meters(lat, lon, t_lat, t_lon) > DEDUP_RADIUS_METERS:
+            continue
+        t_expire = info.get("expire")
+        if expire_ts and t_expire and abs(expire_ts - t_expire) > DEDUP_TIME_TOLERANCE_SECONDS:
+            continue
+        return tid
+    return None
+
+def track_record(record, now):
+    """Records `record` as alerted-on under its own id -- the lat/lon/
+    pokemon_id/form stashed alongside the expiry are exactly what
+    find_existing_tracked_match() needs to recognize this same entry if
+    the OTHER source reports it next cycle."""
+    tracked_ids[record.get("id")] = {
+        "expire": record.get("expire_timestamp", now + 3600),
+        "pokemon_id": record.get("pokemon_id"),
+        "form": record.get("form") or 0,
+        "lat": record.get("lat"),
+        "lon": record.get("lon"),
+    }
+
 def prune_tracked_ids(now):
-    expired = [pid for pid, exp in tracked_ids.items() if now > exp + FORGET_AFTER_EXPIRY]
+    expired = [pid for pid, info in tracked_ids.items() if now > info.get("expire", 0) + FORGET_AFTER_EXPIRY]
     for pid in expired:
         del tracked_ids[pid]
     if expired:
@@ -989,13 +1243,24 @@ def load_tracked_state():
     """Restores tracked_ids/tracked_pvp_ids from disk if a state file from
     a previous run exists -- see TRACKED_STATE_PATH above for why this
     matters. Missing/corrupt file just means starting fresh (not fatal;
-    worst case is a handful of re-alerts, same as before this existed)."""
+    worst case is a handful of re-alerts, same as before this existed).
+
+    tracked_ids entries from a state file saved before cross-source dedup
+    existed are a bare number (the old id -> expire_timestamp shape)
+    rather than today's dict -- upgraded in place to the new shape with
+    everything but the expiry unknown, so they still prune correctly and
+    still work for exact-id matching, just without the fuzzy cross-source
+    fallback until they naturally expire."""
     if not os.path.exists(TRACKED_STATE_PATH):
         return
     try:
         with open(TRACKED_STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
-        tracked_ids.update(state.get("tracked_ids", {}))
+        for rid, info in state.get("tracked_ids", {}).items():
+            if isinstance(info, dict):
+                tracked_ids[rid] = info
+            else:
+                tracked_ids[rid] = {"expire": info, "pokemon_id": None, "form": 0, "lat": None, "lon": None}
         tracked_pvp_ids.update(state.get("tracked_pvp_ids", {}))
         logger.info(
             f"Restored tracked state from disk: {len(tracked_ids)} id(s), "
@@ -1054,12 +1319,17 @@ def main():
         )
     else:
         logger.info("ZONE_WEBHOOK not set -- zone-mirrored alerts disabled.")
+    if SECONDARY_TOKEN:
+        logger.info("Secondary source enabled.")
+    else:
+        logger.info("SECONDARY_TOKEN not set -- secondary source disabled.")
     if MAX_RUNTIME_SECONDS:
         logger.info(f"Will exit cleanly after ~{int(MAX_RUNTIME_SECONDS)}s (MAX_RUNTIME_SECONDS set).")
 
     start_time = time.time()
     was_session_expired = False
     was_client_outdated = False
+    was_secondary_auth_failed = False
     cycle = 0
     while True:
         if MAX_RUNTIME_SECONDS and (time.time() - start_time) >= MAX_RUNTIME_SECONDS:
@@ -1106,16 +1376,56 @@ def main():
         confirmed_matches = [e for e in entries if e.get("iv") == 100]
         logger.debug(f"{len(confirmed_matches)}/{len(entries)} returned entries confirmed as a match.")
 
+        # Secondary data source -- entirely independent backend, own auth,
+        # own failure mode, so its own try/except rather than piggybacking
+        # on the primary query's (same pattern as the PVP query below). A
+        # failure here never blocks the primary source's alerts; it just
+        # means this cycle only has the primary source's view, same as
+        # before this feature existed.
+        if SECONDARY_TOKEN:
+            try:
+                secondary_entries = query_secondary_entries()
+            except SecondaryAuthError as e:
+                logger.error(f"Secondary source auth failed: {e}")
+                if not was_secondary_auth_failed:
+                    send_discord_text(
+                        "⚠️ Watcher: the secondary source rejected SECONDARY_TOKEN -- "
+                        f"{e} (that source's alerts are paused until it's refreshed)."
+                    )
+                    was_secondary_auth_failed = True
+                secondary_entries = []
+            except (requests.RequestException, RuntimeError) as e:
+                logger.error(f"Secondary source query failed: {e}")
+                secondary_entries = []
+            else:
+                if was_secondary_auth_failed:
+                    logger.info("Secondary source token is working again.")
+                    send_discord_text("✅ Watcher: the secondary source token is working again.")
+                    was_secondary_auth_failed = False
+                secondary_matches = [e for e in secondary_entries if e.get("iv") == 100]
+                logger.debug(f"{len(secondary_matches)}/{len(secondary_entries)} secondary-source entries confirmed as a match.")
+                confirmed_matches += secondary_matches
+
+        # Before posting anything: find_existing_tracked_match() checks
+        # BOTH an exact id match AND the cross-source fuzzy fallback, so a
+        # record either source already alerted on (this cycle or an
+        # earlier one) is recognized here regardless of which source
+        # originally caught it -- this is what keeps the two sources from
+        # ever double-posting the same real entry.
         new_count = 0
         for record in confirmed_matches:
             rid = record.get("id")
             if rid is None:
                 continue
-            if rid in tracked_ids:
+            if find_existing_tracked_match(record) is not None:
                 continue
-            tracked_ids[rid] = record.get("expire_timestamp", now + 3600)
+            track_record(record, now)
             new_count += 1
-            logger.info(f"New match: {describe_entry(record.get('pokemon_id'), record.get('form'))} (id={rid})")
+            source_label = SOURCE_LABELS.get(record.get("_source", DEFAULT_SOURCE), record.get("_source"))
+            logger.info(
+                f"New match: {describe_entry(record.get('pokemon_id'), record.get('form'))} "
+                f"(id={rid}, {source_label})"
+            )
             send_alert(record)
 
         if new_count == 0:

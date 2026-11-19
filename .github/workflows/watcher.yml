@@ -62,5 +62,10 @@ jobs:
           ZONE_MAX_LAT: ${{ secrets.ZONE_MAX_LAT }}
           ZONE_MIN_LON: ${{ secrets.ZONE_MIN_LON }}
           ZONE_MAX_LON: ${{ secrets.ZONE_MAX_LON }}
+          SECONDARY_API_BASE: ${{ secrets.SECONDARY_API_BASE }}
+          SECONDARY_SITE: ${{ secrets.SECONDARY_SITE }}
+          SECONDARY_TOKEN: ${{ secrets.SECONDARY_TOKEN }}
+          PRIMARY_SOURCE_LABEL: ${{ secrets.PRIMARY_SOURCE_LABEL }}
+          SECONDARY_SOURCE_LABEL: ${{ secrets.SECONDARY_SOURCE_LABEL }}
           MAX_RUNTIME_SECONDS: "20700"
         run: python watcher.py

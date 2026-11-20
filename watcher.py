@@ -32,8 +32,9 @@ SECONDARY_API_BASE, SECONDARY_SITE, and SECONDARY_TOKEN (a bearer token
 captured from that source's own browser session -- devtools -> Network
 tab -> the relevant request -> Authorization header). Duplicate entries
 reported by both sources are suppressed (see find_existing_tracked_match);
-each alert's embed footer discreetly names which source actually caught
-it (PRIMARY_SOURCE_LABEL / SECONDARY_SOURCE_LABEL, both also optional).
+each alert's title emoji discreetly shifts color (red/yellow) by which
+source actually caught it (PRIMARY_SOURCE_LABEL / SECONDARY_SOURCE_LABEL
+still name the source in log lines, just not in the alert itself).
 Optionally set SECONDARY_MIN_LAT/MAX_LAT/MIN_LON/MAX_LON (all four, or
 not at all) to query that source over a different, smaller bbox than
 MIN_LAT/MAX_LAT/MIN_LON/MAX_LON above.
@@ -289,10 +290,11 @@ GENDER_LABELS = {
     3: "⚪ Genderless",
 }
 
-# Discreet per-source attribution shown in each alert's embed footer (small
-# grey text, not part of the main content) -- lets you tell at a glance
-# which backend actually caught a given entry without cluttering the alert
-# itself, and without putting either deployment's actual name in the
+# Per-source attribution -- not shown in the Discord alert itself (see
+# MATCH_TITLE_EMOJI below for the actual user-visible indicator), only
+# used in main()'s own log lines so it's possible to tell which backend
+# caught a given entry from the log/console without digging through
+# Discord, and without putting either deployment's actual name in the
 # committed code (configurable, like API_BASE/COOKIE_NAME above). A record
 # dict's "_source" key selects which label; absent (every dict straight
 # from the GraphQL query above) means the default/primary source.
@@ -301,8 +303,7 @@ GENDER_LABELS = {
 # workflow's env: block DEFINES this var even when that secret was never
 # set -- as an empty string, not an absent one. os.environ.get's default
 # only kicks in when the key is missing entirely, so it was returning ""
-# instead of falling back, producing a footer that just said "via " with
-# nothing after it. `or` catches the empty-string case too.
+# instead of falling back. `or` catches the empty-string case too.
 PRIMARY_SOURCE_LABEL = os.environ.get("PRIMARY_SOURCE_LABEL") or "primary source"
 SECONDARY_SOURCE_LABEL = os.environ.get("SECONDARY_SOURCE_LABEL") or "secondary source"
 SOURCE_LABELS = {
@@ -310,6 +311,16 @@ SOURCE_LABELS = {
     "secondary": f"via {SECONDARY_SOURCE_LABEL}",
 }
 DEFAULT_SOURCE = "primary"
+
+# The actual Discord-visible source indicator: the match alert's title
+# emoji itself shifts color per source (red for the default/primary
+# source, yellow for the secondary one) -- visible at a glance in a
+# notification preview, before the message is even opened, without
+# spelling out a source name anywhere prominent.
+MATCH_TITLE_EMOJI = {
+    "primary": "\U0001F534",    # 🔴
+    "secondary": "\U0001F7E1",  # 🟡
+}
 
 # Identifies this script to OpenStreetMap's tile server and Nominatim, per
 # both services' usage policies (they require a descriptive User-Agent, not
@@ -1039,11 +1050,12 @@ def format_embed(record):
         location_lines.append(f"[Open in Google Maps]({maps_url})")
         fields.append({"name": "Location", "value": "\n".join(location_lines), "inline": False})
 
+    source = record.get("_source", DEFAULT_SOURCE)
+    title_emoji = MATCH_TITLE_EMOJI.get(source, MATCH_TITLE_EMOJI[DEFAULT_SOURCE])
     embed = {
-        "title": f"\U0001F534 {name} -- {iv}% match",
+        "title": f"{title_emoji} {name} -- {iv}% match",
         "color": ALERT_COLOR,
         "fields": fields,
-        "footer": {"text": SOURCE_LABELS.get(record.get("_source", DEFAULT_SOURCE), record.get("_source"))},
     }
     icon_url = build_icon_url(record)
     if icon_url:
@@ -1148,7 +1160,6 @@ def format_pvp_embed(record, qualifying_leagues):
         "title": f"\U0001F3C6 {name} -- {' / '.join(rank_bits)}",
         "color": PVP_ALERT_COLOR,
         "fields": fields,
-        "footer": {"text": SOURCE_LABELS.get(record.get("_source", DEFAULT_SOURCE), record.get("_source"))},
     }
     icon_url = build_icon_url(record)
     if icon_url:

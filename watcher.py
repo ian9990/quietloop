@@ -296,8 +296,15 @@ GENDER_LABELS = {
 # committed code (configurable, like API_BASE/COOKIE_NAME above). A record
 # dict's "_source" key selects which label; absent (every dict straight
 # from the GraphQL query above) means the default/primary source.
-PRIMARY_SOURCE_LABEL = os.environ.get("PRIMARY_SOURCE_LABEL", "primary source")
-SECONDARY_SOURCE_LABEL = os.environ.get("SECONDARY_SOURCE_LABEL", "secondary source")
+# `or` rather than os.environ.get's own default param: on GitHub Actions,
+# `PRIMARY_SOURCE_LABEL: ${{ secrets.PRIMARY_SOURCE_LABEL }}` in the
+# workflow's env: block DEFINES this var even when that secret was never
+# set -- as an empty string, not an absent one. os.environ.get's default
+# only kicks in when the key is missing entirely, so it was returning ""
+# instead of falling back, producing a footer that just said "via " with
+# nothing after it. `or` catches the empty-string case too.
+PRIMARY_SOURCE_LABEL = os.environ.get("PRIMARY_SOURCE_LABEL") or "primary source"
+SECONDARY_SOURCE_LABEL = os.environ.get("SECONDARY_SOURCE_LABEL") or "secondary source"
 SOURCE_LABELS = {
     "primary": f"via {PRIMARY_SOURCE_LABEL}",
     "secondary": f"via {SECONDARY_SOURCE_LABEL}",
